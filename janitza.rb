@@ -10,8 +10,10 @@ MODBUS_PORT       = ENV.fetch('JANITZA_MODBUS_PORT').to_i
 MODBUS_UNIT       = ENV.fetch('JANITZA_MODBUS_UNIT').to_i
 HASS_MQTT_PREFIX  = ENV.fetch('JANITZA_HASS_MQTT_PREFIX', "janitza-ruby/")
 HASS_MQTT         = ENV.fetch('JANITZA_HASS_MQTT', nil)
+
+VENUS_MQTT_PREFIX = ENV.fetch('JANITZA_VENUS_MQTT_PREFIX', nil)
 VENUS_MQTT        = ENV.fetch('JANITZA_VENUS_MQTT', nil)
-VENUS_MQTT_MODE   = ENV.fetch('JANITZA_VENUS_MQTT_MODE', 'dbus-grid') # one of dbus-grid / dbus-mqtt (not yet supported)
+VENUS_MQTT_MODE   = ENV.fetch('JANITZA_VENUS_MQTT_MODE', 'mixed') # one of mixed / dbus-grid / dbus-mqtt (not yet supported)
 VENUS_MQTT_GRID_TOPIC   = ENV.fetch('JANITZA_VENUS_MQTT_GRID_TOPIC', 'janitza-ruby/dbus-grid')
 
 def now
@@ -124,11 +126,12 @@ Metric = Struct.new(:definition, :value, :timestamp) do
       end&.last
       new_value = transformer.call(value) if transformer
 
-      if VENUS_MQTT == "dbus-mqtt"
-        mqttc.publish(definition.topic, new_value.to_s)
+      if VENUS_MQTT_MODE == "dbus-mqtt" || VENUS_MQTT_MODE == "mixed"
+        mqttc.publish(VENUS_MQTT_PREFIX + definition.topic,
+                      Oj.dump({value: new_value}, mode: :compat))
       end
 
-      if venus_hash && VENUS_MQTT_MODE == "dbus-grid"
+      if venus_hash && (VENUS_MQTT_MODE == "dbus-grid" || VENUS_MQTT_MODE == "mixed")
         definition.dbus_grid.to_a.each do |variable|
           variable.split(".").inject(venus_hash) do |ret, key|
             ret[key] = new_value if ret[key].nil?
@@ -141,6 +144,10 @@ Metric = Struct.new(:definition, :value, :timestamp) do
     end
 
     mqttc.publish(HASS_MQTT_PREFIX + definition.topic.gsub(/^-/,''), value.to_s)
+  rescue StandardError => err
+    logger.error "failed to publish. terminating"
+    logger.error err
+    exit(1)
   end
 
   def prometheus_type
@@ -176,6 +183,7 @@ Thread.new do
 
   duration = nil
   modbus_pre_open = now
+  last_grid_report = now
   ModBus::TCPClient.new(MODBUS_HOST, MODBUS_PORT) do |client|
     client.with_slave(MODBUS_UNIT) do |unit|
       loop do
@@ -192,7 +200,7 @@ Thread.new do
           Metric.new(Registers[index], value, real_time).tap do |metric|
             Fiber.schedule { metric.update! }
             Fiber.schedule { metric.publish(@hass_mqtt) }
-            metric.publish(@venus_mqtt, venus_hash: venus_hash, type: :venus)
+            Fiber.schedule { metric.publish(@venus_mqtt, venus_hash: venus_hash, type: :venus) }
           end
         end
         duration = now - read_registers
@@ -200,13 +208,16 @@ Thread.new do
         Metrics["collecting_registers_count_total"].increment.update!
 
         if duration > 0.1
-          if VENUS_MQTT_MODE == "dbus-grid"
-            Fiber.schedule { @venus_mqtt.publish(VENUS_MQTT_GRID_TOPIC, Oj.dump(venus_hash, mode: :compat)) }
-          end
+          logger.warn "skipping grid report, register fetch pressure"
           next
         end
 
         sleep(0.1-duration)
+
+        if VENUS_MQTT_MODE == "mixed" && (now - last_grid_report) > 10
+          Fiber.schedule { @venus_mqtt.publish(VENUS_MQTT_GRID_TOPIC, Oj.dump(venus_hash, mode: :compat)) }
+          last_grid_report = now
+        end
         if VENUS_MQTT_MODE == "dbus-grid"
           Fiber.schedule { @venus_mqtt.publish(VENUS_MQTT_GRID_TOPIC, Oj.dump(venus_hash, mode: :compat)) }
         end
